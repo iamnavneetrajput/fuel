@@ -2,6 +2,8 @@ import asyncio
 import httpx
 import re
 import random
+import os
+import json
 from lxml import html
 from datetime import datetime
 
@@ -55,14 +57,20 @@ def init_sheet():
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds = ServiceAccountCredentials.from_json_keyfile_name("credentials.json", scope)
+
+    creds_json = os.environ.get("GOOGLE_CREDS")
+    if not creds_json:
+        raise Exception("GOOGLE_CREDS not found in environment variables")
+
+    creds_dict = json.loads(creds_json)
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+
     client = gspread.authorize(creds)
     return client.open("Fuel Prices").sheet1
 
-# ================= EXTRACTION (FIXED) =================
+# ================= EXTRACTION =================
 
 def extract_price(tree, fuel):
-    # PRIMARY
     nodes = tree.xpath('//h2[@id="BC_lblCurrent"]')
 
     for node in nodes:
@@ -72,25 +80,19 @@ def extract_price(tree, fuel):
             if match:
                 return float(match.group(1))
 
-    # FALLBACK (CRITICAL - was missing in your new code)
     fallback = tree.xpath('//div[@class="UCBottomHalf"]//div[@class="fnt27"]/text()')
     if fallback:
         match = re.search(r"₹\s*(\d+\.?\d*)", fallback[0])
         if match:
             return float(match.group(1))
 
-    return None  # DO NOT return 0
+    return None
 
-# ================= FETCH (FIXED) =================
+# ================= FETCH =================
 
 async def fetch_price(client, url, fuel, semaphore):
     async with semaphore:
-
-        # Smart delay (prevents blocking)
-        if "Kolkata" in url and "CNG" in url:
-            await asyncio.sleep(random.uniform(3, 6))
-        else:
-            await asyncio.sleep(random.uniform(1, 2.5))
+        await asyncio.sleep(random.uniform(1, 3))
 
         headers = BASE_HEADERS.copy()
         headers["User-Agent"] = random.choice(USER_AGENTS)
@@ -100,26 +102,25 @@ async def fetch_price(client, url, fuel, semaphore):
                 resp = await client.get(url, headers=headers, timeout=10)
 
                 if resp.status_code == 403:
-                    raise Exception("Blocked")
+                    raise Exception("Blocked (403)")
 
                 resp.raise_for_status()
 
                 tree = html.fromstring(resp.text)
                 return extract_price(tree, fuel)
 
-            except:
+            except Exception as e:
+                print(f"Retry {attempt+1} failed for {fuel}: {e}")
                 if attempt == 2:
                     return None
                 await asyncio.sleep(2 ** attempt)
 
-# ================= SCRAPER (FIXED) =================
+# ================= SCRAPER =================
 
 async def scrape():
     semaphore = asyncio.Semaphore(3)
 
     async with httpx.AsyncClient(follow_redirects=True) as client:
-
-        # Warmup request (important)
         await client.get("https://www.mypetrolprice.com/")
 
         targets = [
@@ -159,14 +160,7 @@ async def scrape():
 
             await asyncio.sleep(RETRY_DELAY)
 
-        return {
-            city: {
-                "Petrol": all_success.get(city, {}).get("Petrol", 0),
-                "Diesel": all_success.get(city, {}).get("Diesel", 0),
-                "CNG": all_success.get(city, {}).get("CNG", 0),
-            }
-            for city in URLS
-        }
+        return all_success
 
 # ================= PREVIOUS =================
 
@@ -179,13 +173,12 @@ def get_previous_block(sheet):
     rows = values[1:4] if len(values) >= 4 else []
 
     for i, fuel in enumerate(fuels):
-        if i < len(rows):
-            prev[fuel] = {
-                city: float(rows[i][2 + idx]) if rows[i][2 + idx] else 0
-                for idx, city in enumerate(cities)
-            }
-        else:
-            prev[fuel] = {city: 0 for city in cities}
+        prev[fuel] = {}
+        for idx, city in enumerate(cities):
+            try:
+                prev[fuel][city] = float(rows[i][2 + idx])
+            except:
+                prev[fuel][city] = None
 
     return prev
 
@@ -199,10 +192,10 @@ def calc_changes(current, prev):
 
     for fuel in fuels:
         for city in cities:
-            old = prev.get(fuel, {}).get(city, 0)
-            new = current[city][fuel]
+            old = prev.get(fuel, {}).get(city)
+            new = current.get(city, {}).get(fuel)
 
-            if old:
+            if old and new:
                 val = (new - old) / old
                 changes[fuel][city] = round(val, 2)
             else:
@@ -222,63 +215,51 @@ def update_sheet(sheet, data, changes):
 
     date_str = datetime.now().strftime("%d %B %Y")
     fuels = ["Petrol", "Diesel", "CNG"]
+    cities = ["Delhi", "Mumbai", "Kolkata", "Chennai"]
 
     new_rows = []
+
     for i, fuel in enumerate(fuels):
-        new_rows.append([
+        row = [
             date_str if i == 0 else "",
             fuel,
-            data["Delhi"][fuel],
-            data["Mumbai"][fuel],
-            data["Kolkata"][fuel],
-            data["Chennai"][fuel],
+        ]
+
+        for city in cities:
+            value = data.get(city, {}).get(fuel)
+            row.append(value if value is not None else "N/A")
+
+        row += [
             fuel + " %",
             changes[fuel]["Delhi"],
             changes[fuel]["Mumbai"],
             changes[fuel]["Kolkata"],
             changes[fuel]["Chennai"],
-        ])
+        ]
+
+        new_rows.append(row)
 
     separator = [""] * 11
     final = [header] + new_rows + [separator] + values[1:]
 
     sheet.update("A1", final)
 
-    total_rows = len(final)
-
-    if total_rows > 5:
-        red = CellFormat(backgroundColor=Color(1, 0.85, 0.85))
-        format_cell_range(sheet, f"A6:K{total_rows}", red)
-
-    for r in range(2, 5):
-        for c in range(8, 12):
-            val = sheet.cell(r, c).value
-            try:
-                v = float(val)
-                if v > 0:
-                    fmt = CellFormat(textFormat=TextFormat(foregroundColor=Color(0, 0.6, 0)))
-                elif v < 0:
-                    fmt = CellFormat(textFormat=TextFormat(foregroundColor=Color(0.8, 0, 0)))
-                else:
-                    fmt = CellFormat(textFormat=TextFormat(foregroundColor=Color(0, 0, 0)))
-
-                format_cell_range(sheet, f"{chr(64+c)}{r}", fmt)
-            except:
-                pass
-
 # ================= MAIN =================
 
 async def main():
+    print("Starting scraper...")
+
     sheet = init_sheet()
 
     current = await scrape()
-    prev = get_previous_block(sheet)
+    print("Scraped data:", current)
 
+    prev = get_previous_block(sheet)
     changes = calc_changes(current, prev)
 
     update_sheet(sheet, current, changes)
 
-    print("✅ FIXED: No missing data + retries + fallback working")
+    print("✅ Done")
 
 if __name__ == "__main__":
     asyncio.run(main())

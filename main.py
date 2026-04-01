@@ -18,37 +18,34 @@ RETRY_DELAY = 5
 
 URLS = {
     "Delhi": {
-        "Petrol": "https://www.mypetrolprice.com/2/Petrol-price-in-Delhi",
-        "Diesel": "https://www.mypetrolprice.com/2/Diesel-price-in-Delhi",
-        "CNG": "https://www.mypetrolprice.com/2/CNG-price-in-Delhi",
+        "Petrol": "https://www.goodreturns.in/petrol-price-in-new-delhi.html",
+        "Diesel": "https://www.goodreturns.in/diesel-price-in-new-delhi.html",
+        "CNG": "https://www.goodreturns.in/cng-price-in-new-delhi.html",
     },
     "Mumbai": {
-        "Petrol": "https://www.mypetrolprice.com/3/Petrol-price-in-Mumbai",
-        "Diesel": "https://www.mypetrolprice.com/3/Diesel-price-in-Mumbai",
-        "CNG": "https://www.mypetrolprice.com/3/CNG-price-in-Mumbai",
+        "Petrol": "https://www.goodreturns.in/petrol-price-in-mumbai.html",
+        "Diesel": "https://www.goodreturns.in/diesel-price-in-mumbai.html",
+        "CNG": "https://www.goodreturns.in/cng-price-in-mumbai.html",
     },
     "Kolkata": {
-        "Petrol": "https://www.mypetrolprice.com/4/Petrol-price-in-Kolkata",
-        "Diesel": "https://www.mypetrolprice.com/4/Diesel-price-in-Kolkata",
-        "CNG": "https://www.mypetrolprice.com/4/CNG-price-in-Kolkata",
+        "Petrol": "https://www.goodreturns.in/petrol-price-in-kolkata.html",
+        "Diesel": "https://www.goodreturns.in/diesel-price-in-kolkata.html",
+        "CNG": "https://www.goodreturns.in/cng-price-in-kolkata.html",
     },
     "Chennai": {
-        "Petrol": "https://www.mypetrolprice.com/5/Petrol-price-in-Chennai",
-        "Diesel": "https://www.mypetrolprice.com/5/Diesel-price-in-Chennai",
-        "CNG": "https://www.mypetrolprice.com/5/CNG-price-in-Chennai",
+        "Petrol": "https://www.goodreturns.in/petrol-price-in-chennai.html",
+        "Diesel": "https://www.goodreturns.in/diesel-price-in-chennai.html",
+        "CNG": "https://www.goodreturns.in/cng-price-in-chennai.html",
     },
 }
 
-BASE_HEADERS = {
+# 🔥 REAL HEADERS
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml",
     "Accept-Language": "en-IN,en;q=0.9",
-    "Referer": "https://www.mypetrolprice.com/",
+    "Connection": "keep-alive",
 }
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Macintosh)",
-    "Mozilla/5.0 (Windows NT 10.0)",
-    "Mozilla/5.0 (X11; Linux)",
-]
 
 # ================= SHEET =================
 
@@ -70,58 +67,58 @@ def init_sheet():
 
 # ================= EXTRACTION =================
 
-def extract_price(tree, fuel):
-    nodes = tree.xpath('//h2[@id="BC_lblCurrent"]')
+def extract_price(tree):
+    texts = tree.xpath('//div[contains(@class,"gd-fuel-price")]//text()')
 
-    for node in nodes:
-        text = "".join(node.xpath(".//text()")).lower()
-        if fuel.lower() in text:
-            match = re.search(r"₹\s*(\d+\.\d+)", text)
+    for t in texts:
+        t = t.strip()
+        if "₹" in t:
+            match = re.search(r"₹\s*(\d+(?:\.\d+)?)", t)
             if match:
                 return float(match.group(1))
-
-    fallback = tree.xpath('//div[@class="UCBottomHalf"]//div[@class="fnt27"]/text()')
-    if fallback:
-        match = re.search(r"₹\s*(\d+\.?\d*)", fallback[0])
-        if match:
-            return float(match.group(1))
 
     return None
 
 # ================= FETCH =================
 
-async def fetch_price(client, url, fuel, semaphore):
+async def fetch_price(client, url, semaphore):
     async with semaphore:
-        await asyncio.sleep(random.uniform(1, 3))
 
-        headers = BASE_HEADERS.copy()
-        headers["User-Agent"] = random.choice(USER_AGENTS)
+        await asyncio.sleep(random.uniform(2, 5))
 
-        for attempt in range(3):
+        for attempt in range(4):
             try:
-                resp = await client.get(url, headers=headers, timeout=10)
+                resp = await client.get(url, headers=HEADERS, timeout=15)
 
                 if resp.status_code == 403:
-                    raise Exception("Blocked (403)")
+                    raise Exception("Blocked")
 
                 resp.raise_for_status()
 
                 tree = html.fromstring(resp.text)
-                return extract_price(tree, fuel)
+                return extract_price(tree)
 
             except Exception as e:
-                print(f"Retry {attempt+1} failed for {fuel}: {e}")
-                if attempt == 2:
+                print(f"Retry {attempt+1} failed: {url} -> {e}")
+
+                await asyncio.sleep(random.uniform(3, 6) * (attempt + 1))
+
+                if attempt == 3:
                     return None
-                await asyncio.sleep(2 ** attempt)
 
 # ================= SCRAPER =================
 
 async def scrape():
-    semaphore = asyncio.Semaphore(3)
+    semaphore = asyncio.Semaphore(2)  # 🔥 reduced concurrency
 
-    async with httpx.AsyncClient(follow_redirects=True) as client:
-        await client.get("https://www.mypetrolprice.com/")
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        headers=HEADERS,
+        timeout=20,
+    ) as client:
+
+        # 🔥 warmup
+        await client.get("https://www.goodreturns.in/")
 
         targets = [
             (city, fuel, url)
@@ -136,7 +133,7 @@ async def scrape():
             failed = []
 
             tasks = [
-                (city, fuel, fetch_price(client, url, fuel, semaphore))
+                (city, fuel, fetch_price(client, url, semaphore))
                 for city, fuel, url in targets
             ]
 
