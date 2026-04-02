@@ -9,7 +9,6 @@ from datetime import datetime
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-from gspread_formatting import format_cell_range, CellFormat, Color, TextFormat
 
 # ================= CONFIG =================
 
@@ -39,12 +38,9 @@ URLS = {
     },
 }
 
-# 🔥 REAL HEADERS
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml",
-    "Accept-Language": "en-IN,en;q=0.9",
-    "Connection": "keep-alive",
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "text/html",
 }
 
 # ================= SHEET =================
@@ -56,13 +52,11 @@ def init_sheet():
     ]
 
     creds_json = os.environ.get("GOOGLE_CREDS")
-    if not creds_json:
-        raise Exception("GOOGLE_CREDS not found in environment variables")
-
     creds_dict = json.loads(creds_json)
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
 
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
     client = gspread.authorize(creds)
+
     return client.open("Fuel Prices").sheet1
 
 # ================= EXTRACTION =================
@@ -76,105 +70,85 @@ def extract_price(tree):
             match = re.search(r"₹\s*(\d+(?:\.\d+)?)", t)
             if match:
                 return float(match.group(1))
-
     return None
 
 # ================= FETCH =================
 
 async def fetch_price(client, url, semaphore):
     async with semaphore:
-
-        await asyncio.sleep(random.uniform(2, 5))
+        await asyncio.sleep(random.uniform(2, 4))
 
         for attempt in range(4):
             try:
                 resp = await client.get(url, headers=HEADERS, timeout=15)
-
-                if resp.status_code == 403:
-                    raise Exception("Blocked")
-
                 resp.raise_for_status()
 
                 tree = html.fromstring(resp.text)
                 return extract_price(tree)
 
-            except Exception as e:
-                print(f"Retry {attempt+1} failed: {url} -> {e}")
+            except:
+                await asyncio.sleep(2 * (attempt + 1))
 
-                await asyncio.sleep(random.uniform(3, 6) * (attempt + 1))
-
-                if attempt == 3:
-                    return None
+        return None
 
 # ================= SCRAPER =================
 
 async def scrape():
-    semaphore = asyncio.Semaphore(2)  # 🔥 reduced concurrency
+    semaphore = asyncio.Semaphore(2)
 
-    async with httpx.AsyncClient(
-        follow_redirects=True,
-        headers=HEADERS,
-        timeout=20,
-    ) as client:
-
-        # 🔥 warmup
-        await client.get("https://www.goodreturns.in/")
-
+    async with httpx.AsyncClient() as client:
         targets = [
             (city, fuel, url)
             for city, fuels in URLS.items()
             for fuel, url in fuels.items()
         ]
 
-        all_success = {}
+        result = {}
 
-        for _ in range(MAX_RETRY_ROUNDS):
-            success = {}
-            failed = []
+        tasks = [
+            (city, fuel, fetch_price(client, url, semaphore))
+            for city, fuel, url in targets
+        ]
 
-            tasks = [
-                (city, fuel, fetch_price(client, url, semaphore))
-                for city, fuel, url in targets
-            ]
+        responses = await asyncio.gather(*[t[2] for t in tasks])
 
-            results = await asyncio.gather(*[t[2] for t in tasks])
+        for i, res in enumerate(responses):
+            city, fuel, _ = tasks[i]
+            result.setdefault(city, {})[fuel] = res
 
-            for i, result in enumerate(results):
-                city, fuel, _ = tasks[i]
+        return result
 
-                if result is None:
-                    failed.append((city, fuel, URLS[city][fuel]))
-                else:
-                    success.setdefault(city, {})[fuel] = result
-
-            for city, fuels in success.items():
-                all_success.setdefault(city, {}).update(fuels)
-
-            targets = failed
-
-            if not targets:
-                break
-
-            await asyncio.sleep(RETRY_DELAY)
-
-        return all_success
-
-# ================= PREVIOUS =================
+# ================= PREVIOUS DATA =================
 
 def get_previous_block(sheet):
     values = sheet.get_all_values()
+
     fuels = ["Petrol", "Diesel", "CNG"]
     cities = ["Delhi", "Mumbai", "Kolkata", "Chennai"]
 
-    prev = {}
-    rows = values[1:4] if len(values) >= 4 else []
+    prev = {fuel: {} for fuel in fuels}
+
+    # Skip header + current block (3 rows) + separator
+    start_row = None
+
+    for i in range(1, len(values)):
+        if values[i][1] in fuels:
+            start_row = i
+            break
+
+    if start_row is None:
+        return prev
 
     for i, fuel in enumerate(fuels):
-        prev[fuel] = {}
-        for idx, city in enumerate(cities):
-            try:
-                prev[fuel][city] = float(rows[i][2 + idx])
-            except:
+        row = values[start_row + i]
+
+        try:
+            prev[fuel]["Delhi"] = float(row[2])
+            prev[fuel]["Mumbai"] = float(row[4])
+            prev[fuel]["Kolkata"] = float(row[6])
+            prev[fuel]["Chennai"] = float(row[8])
+        except:
+            for city in cities:
                 prev[fuel][city] = None
 
     return prev
@@ -192,9 +166,8 @@ def calc_changes(current, prev):
             old = prev.get(fuel, {}).get(city)
             new = current.get(city, {}).get(fuel)
 
-            if old and new:
-                val = (new - old) / old
-                changes[fuel][city] = round(val, 2)
+            if old is not None and new is not None and old != 0:
+                changes[fuel][city] = (new - old) / old
             else:
                 changes[fuel][city] = 0
 
@@ -206,8 +179,11 @@ def update_sheet(sheet, data, changes):
     values = sheet.get_all_values()
 
     header = [
-        "Date", "Fuel Type", "Delhi", "Mumbai", "Kolkata", "Chennai",
-        "Fuel %", "Delhi %", "Mumbai %", "Kolkata %", "Chennai %"
+        "Date", "Fuel Type",
+        "Delhi", "Delhi %",
+        "Mumbai", "Mumbai %",
+        "Kolkata", "Kolkata %",
+        "Chennai", "Chennai %"
     ]
 
     date_str = datetime.now().strftime("%d %B %Y")
@@ -217,26 +193,19 @@ def update_sheet(sheet, data, changes):
     new_rows = []
 
     for i, fuel in enumerate(fuels):
-        row = [
-            date_str if i == 0 else "",
-            fuel,
-        ]
+        row = [date_str if i == 0 else "", fuel]
 
         for city in cities:
             value = data.get(city, {}).get(fuel)
-            row.append(value if value is not None else "N/A")
+            change = changes[fuel][city]
 
-        row += [
-            fuel + " %",
-            changes[fuel]["Delhi"],
-            changes[fuel]["Mumbai"],
-            changes[fuel]["Kolkata"],
-            changes[fuel]["Chennai"],
-        ]
+            row.append(value if value else "N/A")
+            row.append(change)
 
         new_rows.append(row)
 
-    separator = [""] * 11
+    separator = [""] * len(header)
+
     final = [header] + new_rows + [separator] + values[1:]
 
     sheet.update("A1", final)
@@ -244,12 +213,12 @@ def update_sheet(sheet, data, changes):
 # ================= MAIN =================
 
 async def main():
-    print("Starting scraper...")
+    print("Starting...")
 
     sheet = init_sheet()
 
     current = await scrape()
-    print("Scraped data:", current)
+    print("Data:", current)
 
     prev = get_previous_block(sheet)
     changes = calc_changes(current, prev)
